@@ -81,9 +81,9 @@ void effect_start (int & channels, int & rate)
     pthread_mutex_unlock (& mutex);
 }
 
-Index<float> & effect_process (Index<float> & data)
+Index<audio_sample> & effect_process (Index<audio_sample> & data)
 {
-    Index<float> * cur = & data;
+    Index<audio_sample> * cur = & data;
     pthread_mutex_lock (& mutex);
 
     Effect * e = effects.head ();
@@ -97,7 +97,7 @@ Index<float> & effect_process (Index<float> & data)
 
             // simulate end-of-playlist call
             // first save the current data
-            Index<float> save = std::move (* cur);
+            Index<audio_sample> save = std::move (* cur);
             cur = & e->header->finish (* cur, true);
 
             // combine the saved and new data
@@ -135,9 +135,9 @@ bool effect_flush (bool force)
     return flushed;
 }
 
-Index<float> & effect_finish (Index<float> & data, bool end_of_playlist)
+Index<audio_sample> & effect_finish (Index<audio_sample> & data, bool end_of_playlist)
 {
-    Index<float> * cur = & data;
+    Index<audio_sample> * cur = & data;
     pthread_mutex_lock (& mutex);
 
     for (Effect * e = effects.head (); e; e = effects.next (e))

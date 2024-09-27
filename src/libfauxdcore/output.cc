@@ -1,6 +1,7 @@
 /*
  * output.c
- * Copyright 2009-2015 John Lindgren
+ * Copyright 2009-2024 John Lindgren
+ * DSD, DoP and FLOAT64 support added by Maris Abele
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -103,8 +104,9 @@ static int out_bytes_per_sec, out_bytes_held;
 static int64_t in_frames, out_bytes_written;
 static ReplayGainInfo gain_info;
 
-static Index<float> buffer1;
-static Index<char> buffer2;
+static Index<audio_sample> floatbuffer; // Float audio
+static Index<uint8_t> dsdbuffer; // DSD audio
+static Index<char> outbuffer;
 
 static inline int get_format (bool & automatic)
 {
@@ -112,13 +114,33 @@ static inline int get_format (bool & automatic)
 
     switch (aud_get_int (0, "output_bit_depth"))
     {
-        case 16: return FMT_S16_NE;
-        case 24: return FMT_S24_3NE;
-        case 32: return FMT_S32_NE;
+    case 16:
+        if (is_dsd(in_format)) // No DoP for 16 bit
+            return FMT_DSD_MSB16_BE;
+        return FMT_S16_NE;
+    case 24:
+        if (is_dsd(in_format) && !aud_get_bool(nullptr, "dsd_dop"))
+            return FMT_DSD_MSB24_3BE;
+        return FMT_S24_3NE;
+    case 32:
+        if (is_dsd(in_format) && !aud_get_bool(nullptr, "dsd_dop"))
+            return FMT_DSD_MSB32_BE;
+        return FMT_S32_NE;
+    case 64:
+        if (is_dsd(in_format))
+            return FMT_DSD_MSB32_BE;
+        return FMT_FLOAT64;
 
         // return FMT_FLOAT for "auto" as well
-        case -1: automatic = true;
-        default: return FMT_FLOAT;
+    case -1:
+        automatic = true;
+    default:
+        if (is_dsd(in_format))
+        {
+            if (aud_get_bool(nullptr, "dsd_dop")) return FMT_S32_NE;
+            return FMT_DSD_MSB32_BE;
+        }
+        return FMT_FLOAT;
     }
 }
 
@@ -147,8 +169,9 @@ static void cleanup_output ()
 
     s_output = false;
 
-    buffer1.clear ();
-    buffer2.clear ();
+    floatbuffer.clear ();
+    dsdbuffer.clear();
+    outbuffer.clear ();
 
     cop->close_audio ();
     vis_runner_start_stop (false, false);
@@ -168,7 +191,7 @@ static void cleanup_secondary ()
 static void apply_pause ()
 {
     /* JWT:  IF PauseMute SET, PAUSE SHOULD JUST ZERO-OUT OUTPUT (BUT CONTINUE PLAYING)
-             THIS IS SO WE CAN "MUTE" COMMERCIALS FROM RADIO WHILST PLAYING 
+             THIS IS SO WE CAN "MUTE" COMMERCIALS FROM RADIO WHILST PLAYING
              SOMETHING ELSE!  THIS WAY, WE CAN RESUME AT THE CURRENT POINT vs
              WHERE WE PAUSED!
     */
@@ -207,6 +230,12 @@ static void setup_output (bool new_input)
         return;
     }
 
+    if (is_dsd(in_format))
+    {   effect_rate = in_rate;
+        if(aud_get_bool(nullptr, "dsd_dop"))
+            effect_rate = effect_rate * FMT_SIZEOF(out_format) / 2;
+    }
+
     AUDINFO ("Setup output, format %d, %d channels, %d Hz.\n", format, effect_channels, effect_rate);
 
     cleanup_output ();
@@ -215,16 +244,51 @@ static void setup_output (bool new_input)
     while (! open_audio_with_info (cop, in_filename, in_tuple, format,
             effect_rate, effect_channels, error))
     {
-        if (automatic && format == FMT_FLOAT)
-            format = FMT_S32_NE;
-        else if (automatic && format == FMT_S32_NE)
-            format = FMT_S16_NE;
-        else if (format == FMT_S24_3NE)
-            format = FMT_S24_NE; /* some output plugins support only padded 24-bit */
+        if (!is_dsd(in_format) || aud_get_bool(nullptr, "dsd_dop"))
+        {   // PCM
+            if (automatic && format == FMT_FLOAT)
+#ifdef DEF_AUDIO_FLOAT64
+                format = FMT_FLOAT64;
+            else if (automatic && format == FMT_FLOAT64)
+#endif
+                format = FMT_S32_NE;
+            else if (automatic && format == FMT_S32_NE)
+                format = FMT_S24_NE; // some output plugins support only padded 24-bit
+            else if (automatic && format == FMT_S24_NE)
+                format = FMT_S24_3NE;
+            else if (automatic && format == FMT_S24_3NE)
+                format = FMT_S16_NE;
+            else if (format == FMT_S16_NE)
+                {
+                    format = FMT_S32_NE; // Default format after fail
+                    automatic = false;
+                }
+            else
+            {
+                aud_ui_show_error(error ? (const char *)error
+                                        : _("Error opening PCM output stream"));
+                return;
+            }
+        }
         else
-        {
-            aud_ui_show_error (error ? (const char *) error : _("Error opening output stream"));
-            return;
+        {   // DSD
+            if (automatic && format == FMT_FLOAT)
+                format = FMT_DSD_MSB32_NE;
+            else if (automatic && format == FMT_DSD_MSB32_NE)
+                format = FMT_DSD_MSB16_BE; // some output plugins support only padded 24-bit
+            else if (automatic && format == FMT_DSD_MSB16_BE)
+                format = FMT_DSD_MSB24_3BE;
+            else if (automatic && format == FMT_DSD_MSB24_3BE)
+                {
+                    format = FMT_DSD_MSB32_NE; // Default format after fail
+                    automatic = false;
+                }
+            else
+            {
+                aud_ui_show_error(error ? (const char *)error
+                                        : _("Error opening DSD output stream"));
+                return;
+            }
         }
 
         AUDINFO ("Falling back to format %d.\n", format);
@@ -237,6 +301,9 @@ static void setup_output (bool new_input)
     out_rate = effect_rate;
 
     out_bytes_per_sec = FMT_SIZEOF (format) * out_channels * out_rate;
+    if (is_dsd(in_format) && aud_get_bool(nullptr, "dsd_dop"))
+        out_bytes_per_sec = out_bytes_per_sec * 2 / FMT_SIZEOF(out_format);
+
     out_bytes_held = 0;
     out_bytes_written = 0;
 
@@ -295,7 +362,7 @@ static void flush_output ()
     vis_runner_flush ();
 }
 
-static void apply_replay_gain (Index<float> & data)
+static void apply_replay_gain (Index<audio_sample> & data)
 {
     int extra_gain_factor = aud_get_fudge_gain ();  /* JWT:TO ALLOW SPECIFYING FUDGE-GAIN */
     if (! aud_get_bool (0, "enable_replay_gain"))
@@ -342,7 +409,7 @@ static void apply_replay_gain (Index<float> & data)
 }
 
 /* assumes LOCK_MINOR, s_secondary */
-static void write_secondary (const Index<float> & data)
+static void write_secondary (const Index<audio_sample> & data)
 {
     auto begin = (const char *) data.begin ();
     auto end = (const char *) data.end ();
@@ -352,41 +419,59 @@ static void write_secondary (const Index<float> & data)
 }
 
 /* assumes LOCK_ALL, s_output */
-static void write_output (Index<float> & data)
+static void write_output (Index<audio_sample> & data)
 {
-    if (! data.len ())
-        return;
+    void * out_data;
 
-    if (s_secondary && record_stream == OutputStream::AfterEffects)
-        write_secondary (data);
-
-    int out_time = aud::rescale<int64_t> (out_bytes_written, out_bytes_per_sec, 1000);
-    vis_runner_pass_audio (out_time, data, out_channels, out_rate);
-
-    eq_filter (data.begin (), data.len ());
-
-    if (s_secondary && record_stream == OutputStream::AfterEqualizer)
-        write_secondary (data);
-
-    if (aud_get_bool (0, "software_volume_control"))
+    if (is_dsd(in_format))
     {
-        StereoVolume v = {aud_get_int (0, "sw_volume_left"), aud_get_int (0, "sw_volume_right")};
-        audio_amplify (data.begin (), out_channels, data.len () / out_channels, v);
+        // DSD audio
+        if (!dsdbuffer.len())
+            return;
+        if (!is_dsd(out_format)) // is_dop
+            outbuffer.resize(dsdbuffer.len()*FMT_SIZEOF(out_format)/2);
+        else
+            outbuffer.resize(dsdbuffer.len());
+        dsdaudio_to_out(dsdbuffer.begin(), outbuffer.begin(), out_format, dsdbuffer.len(), out_channels);
+        out_data = outbuffer.begin();
+        out_bytes_held = outbuffer.len();
     }
-
-    if (aud_get_bool (0, "soft_clipping"))
-        audio_soft_clip (data.begin (), data.len ());
-
-    void * out_data = data.begin ();
-
-    if (out_format != FMT_FLOAT)
+    else
     {
-        buffer2.resize (FMT_SIZEOF (out_format) * data.len ());
-        audio_to_int (data.begin (), buffer2.begin (), out_format, data.len ());
-        out_data = buffer2.begin ();
-    }
+        // Float audio
+        if (! data.len ())
+            return;
 
-    out_bytes_held = FMT_SIZEOF (out_format) * data.len ();
+        if (s_secondary && record_stream == OutputStream::AfterEffects)
+            write_secondary (data);
+
+        int out_time = aud::rescale<int64_t> (out_bytes_written, out_bytes_per_sec, 1000);
+        vis_runner_pass_audio (out_time, data, out_channels, out_rate);
+
+        eq_filter (data.begin (), data.len ());
+
+        if (s_secondary && record_stream == OutputStream::AfterEqualizer)
+            write_secondary (data);
+
+        if (aud_get_bool (0, "software_volume_control"))
+        {
+            StereoVolume v = {aud_get_int (0, "sw_volume_left"), aud_get_int (0, "sw_volume_right")};
+            audio_amplify (data.begin (), out_channels, data.len () / out_channels, v);
+        }
+
+        if (aud_get_bool (0, "soft_clipping"))
+            audio_soft_clip (data.begin (), data.len ());
+        out_data = data.begin();
+
+        if (out_format != FMT_AUDIO_SAMPLE)
+        {
+            outbuffer.resize(FMT_SIZEOF(out_format) * data.len());
+            audio_to_int(data.begin(), outbuffer.begin(), out_format, data.len());
+            out_data = outbuffer.begin();
+        }
+
+        out_bytes_held = FMT_SIZEOF(out_format) * data.len();
+    }
 
     while (! (s_paused && ! pausemuted) && ! s_flushed && ! s_resetting)
     {
@@ -427,24 +512,33 @@ static bool process_audio (const void * data, int size, int stop_time)
         }
     }
 
+    // DSD audio
+    if (is_dsd(in_format))
+    {
+        dsdbuffer.resize(size);
+        dsdaudio_from_in(data, in_format, dsdbuffer.begin(), samples, in_channels);
+
+        in_frames += samples / in_channels / 4 * FMT_SIZEOF(in_format);
+
+        write_output (floatbuffer);
+        return !stopped;
+    }
+
     in_frames += samples / in_channels;
 
-    buffer1.resize (samples);
-
-    if (in_format == FMT_FLOAT)
-        memcpy (buffer1.begin (), data, sizeof (float) * samples);
-    else
-        audio_from_int (data, in_format, buffer1.begin (), samples);
+    // Float audio
+    floatbuffer.resize(samples);
+    audio_from_int(data, in_format, floatbuffer.begin(), samples);
 
     if (s_secondary && record_stream == OutputStream::AsDecoded)
-        write_secondary (buffer1);
+        write_secondary (floatbuffer);
 
-    apply_replay_gain (buffer1);
+    apply_replay_gain (floatbuffer);
 
     if (s_secondary && record_stream == OutputStream::AfterReplayGain)
-        write_secondary (buffer1);
+        write_secondary (floatbuffer);
 
-    write_output (effect_process (buffer1));
+    write_output (effect_process (floatbuffer));
 
     return ! stopped;
 }
@@ -452,8 +546,9 @@ static bool process_audio (const void * data, int size, int stop_time)
 /* assumes LOCK_ALL, s_output */
 static void finish_effects (bool end_of_playlist)
 {
-    buffer1.resize (0);
-    write_output (effect_finish (buffer1, end_of_playlist));
+    floatbuffer.resize (0);
+    dsdbuffer.resize(0);
+    write_output (effect_finish (floatbuffer, end_of_playlist));
 }
 
 /* JWT:NEXT 2 FUNCTIONS ADDED TO ALLOW SONG/STREAM-SPECIFIC EQUALIZATION. */
@@ -498,7 +593,7 @@ static bool do_load_eq_file (StringBuf filename, bool save_prev_preset_as_defaul
                 && aud_get_bool(nullptr, "eqpreset_use_effects"))
         {
             /* RESTORE NON-AUTO EFFECTS PRESETS (P(e)=>P(*)) SINCE SONG MAY NOT HAVE EFFECTS SAVED! */
-            do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/_nonauto.preset"})), 
+            do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/_nonauto.preset"})),
                     false, false);
             aud_set_bool (nullptr, "_autoeffects_loaded", false);
         }
@@ -559,7 +654,7 @@ bool output_open_audio (const String & filename, const Tuple & tuple,
        2) N->P:  (IF [Autoload]) Save current EQ settings as "default", then load entry's auto-preset file.
        3) P->P:  (IF [Autoload]) Load entry's auto-preset file.
        4) P->N:  Load the prev. saved "default" preset file.
-       IF [Autoload] IS OFF, THEN THE ONLY 2 POSSIBLE STATES ARE N->N AND P->N SINCE NO 
+       IF [Autoload] IS OFF, THEN THE ONLY 2 POSSIBLE STATES ARE N->N AND P->N SINCE NO
        SONG-SPECIFIC PRESET FILE IS CHECKED FOR, MUCH LESS LOADED.
     */
     if (strncmp (filename, "cdda://", 7) && strncmp (filename, "dvd://", 6))
@@ -613,12 +708,12 @@ bool output_open_audio (const String & filename, const Tuple & tuple,
             }
             /* JWT:NOT A FILE, OR NOT FOUND, SO NOW CHECK THE GLOBAL CONFIG PATH FOR A SONG PRESET FILE: */
             if (! found_songpreset)
-                found_songpreset = do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/", 
+                found_songpreset = do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/",
                         str_encode_percent (base, ln), ".preset"})), true, true);
         }
         if (! found_songpreset)
         {
-            /* JWT:NO SONG-PRESET: SEE IF IT IS A "FILE" AND, IF SO, CHECK IT'S DIRECTORY FOR A PRESET: 
+            /* JWT:NO SONG-PRESET: SEE IF IT IS A "FILE" AND, IF SO, CHECK IT'S DIRECTORY FOR A PRESET:
                 OR MAYBE WE'RE PLAYING A DISK, CHECK FOR PRESET BY DISK-ID / DVD TITLE: */
             if (! strncmp (filename, "file://", 7))  // LOOK FOR A DIRECTORY PRESET FILE (LIKE XMMS DOES):
             {
@@ -634,7 +729,7 @@ bool output_open_audio (const String & filename, const Tuple & tuple,
             {
                 String playingdiskid = aud_get_str (nullptr, "playingdiskid");
                 if (playingdiskid[0])
-                    found_songpreset = do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/", 
+                    found_songpreset = do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/",
                             playingdiskid, ".preset"})), true, false);
             }
             else if (strncmp (filename, "stdin://", 8))  // WE'RE NOT A FILE, DISK, OR STDIN (ASSUME URL):
@@ -669,7 +764,7 @@ bool output_open_audio (const String & filename, const Tuple & tuple,
        OFF DURING PREV. SONG AND CURRENT SONG WILL NOT'VE BEEN CHECKED FOR A PRESET FILE. */
     if (prev_songautoeq && ! s_songautoeq)
     {
-        do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/_nonauto.preset"})), 
+        do_load_eq_file (filename_to_uri (str_concat ({aud_get_path (AudPath::UserDir), "/_nonauto.preset"})),
                 false, false);
         aud_set_bool (nullptr, "_autoeffects_loaded", false);
     }

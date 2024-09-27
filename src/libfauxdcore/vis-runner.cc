@@ -142,7 +142,7 @@ void vis_runner_start_stop (bool new_playing, bool new_paused)
     pthread_mutex_unlock (& mutex);
 }
 
-void vis_runner_pass_audio (int time, const Index<float> & data, int channels, int rate)
+void vis_runner_pass_audio (int time, const Index<audio_sample> & data, int channels, int rate)
 {
     pthread_mutex_lock (& mutex);
 
@@ -204,7 +204,17 @@ void vis_runner_pass_audio (int time, const Index<float> & data, int channels, i
          * node, we loop and start building a new one. */
 
         int copy = aud::min (data.len () - at, channels * (FRAMES_PER_NODE - current_frames));
+#ifdef DEF_AUDIO_FLOAT64
+        float * destdata = current_node->data + channels * current_frames;
+        const audio_sample * srcdata = &data[at];
+        const audio_sample * const end = srcdata + copy;
+        while (srcdata < end)
+        {
+            *(destdata++) = (float) *(srcdata++);
+        }
+#else
         memcpy (current_node->data + channels * current_frames, & data[at], sizeof (float) * copy);
+#endif
         current_frames += copy / channels;
 
         if (current_frames < FRAMES_PER_NODE)
